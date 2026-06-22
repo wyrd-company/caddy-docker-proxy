@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -312,10 +313,13 @@ func (dockerLoader *DockerLoader) updateServer(wg *sync.WaitGroup, server string
 	log := logger()
 	log.Info("Sending configuration to", zap.String("server", server))
 
-	client, url, err := dockerLoader.adminAPIEndpoint(server)
+	client, url, cleanup, err := dockerLoader.adminAPIEndpoint(server)
 	if err != nil {
 		log.Error("Failed to determine admin API endpoint for", zap.String("server", server), zap.Error(err))
 		return
+	}
+	if cleanup != nil {
+		defer cleanup()
 	}
 
 	postBody, err := dockerLoader.prepareServerConfig(server)
@@ -336,6 +340,7 @@ func (dockerLoader *DockerLoader) updateServer(wg *sync.WaitGroup, server string
 		log.Error("Failed to send configuration to", zap.String("server", server), zap.Error(err))
 		return
 	}
+	defer resp.Body.Close()
 
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -353,14 +358,18 @@ func (dockerLoader *DockerLoader) updateServer(wg *sync.WaitGroup, server string
 	log.Info("Successfully configured", zap.String("server", server))
 }
 
-func (dockerLoader *DockerLoader) adminAPIEndpoint(server string) (*http.Client, string, error) {
-	adminListen := getServerAdminListen(dockerLoader.options, server)
+func (dockerLoader *DockerLoader) adminAPIEndpoint(server string) (*http.Client, string, func(), error) {
+	adminListen := dockerLoader.options.AdminListen
+	if adminListen == "" {
+		return http.DefaultClient, "http://" + server + ":2019/load", nil, nil
+	}
+
 	adminAddr, err := caddy.ParseNetworkAddress(adminListen)
 	if err != nil {
-		return nil, "", fmt.Errorf("invalid admin listen address %s: %w", adminListen, err)
+		return nil, "", nil, fmt.Errorf("invalid admin listen address %s: %w", adminListen, err)
 	}
 	if adminAddr.PortRangeSize() > 1 {
-		return nil, "", fmt.Errorf("admin listen address %s must resolve to a single endpoint", adminListen)
+		return nil, "", nil, fmt.Errorf("admin listen address %s must resolve to a single endpoint", adminListen)
 	}
 
 	if adminAddr.IsUnixNetwork() {
@@ -370,10 +379,25 @@ func (dockerLoader *DockerLoader) adminAPIEndpoint(server string) (*http.Client,
 			var d net.Dialer
 			return d.DialContext(ctx, adminAddr.Network, socketPath)
 		}
-		return &http.Client{Transport: transport}, "http://127.0.0.1/load", nil
+		// Caddy skips Host enforcement for Unix/fd admin listeners; this host
+		// only gives net/http a valid URL for the request.
+		return &http.Client{Transport: transport}, "http://127.0.0.1/load", transport.CloseIdleConnections, nil
 	}
 
-	return http.DefaultClient, "http://" + server + ":2019/load", nil
+	host := adminAddr.Host
+	if isWildcardHost(host) {
+		host = server
+	}
+	port := strconv.FormatUint(uint64(adminAddr.StartPort), 10)
+	return http.DefaultClient, "http://" + net.JoinHostPort(host, port) + "/load", nil, nil
+}
+
+func isWildcardHost(host string) bool {
+	if host == "" {
+		return true
+	}
+	addr := net.ParseIP(host)
+	return addr != nil && addr.IsUnspecified()
 }
 
 // prepareServerConfig builds the config to push to server from the loader's last
