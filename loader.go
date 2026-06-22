@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -310,7 +312,11 @@ func (dockerLoader *DockerLoader) updateServer(wg *sync.WaitGroup, server string
 	log := logger()
 	log.Info("Sending configuration to", zap.String("server", server))
 
-	url := "http://" + server + ":2019/load"
+	client, url, err := dockerLoader.adminAPIEndpoint(server)
+	if err != nil {
+		log.Error("Failed to determine admin API endpoint for", zap.String("server", server), zap.Error(err))
+		return
+	}
 
 	postBody, err := dockerLoader.prepareServerConfig(server)
 	if err != nil {
@@ -324,7 +330,7 @@ func (dockerLoader *DockerLoader) updateServer(wg *sync.WaitGroup, server string
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 
 	if err != nil {
 		log.Error("Failed to send configuration to", zap.String("server", server), zap.Error(err))
@@ -345,6 +351,29 @@ func (dockerLoader *DockerLoader) updateServer(wg *sync.WaitGroup, server string
 	dockerLoader.serversVersions.Set(server, version)
 
 	log.Info("Successfully configured", zap.String("server", server))
+}
+
+func (dockerLoader *DockerLoader) adminAPIEndpoint(server string) (*http.Client, string, error) {
+	adminListen := getServerAdminListen(dockerLoader.options, server)
+	adminAddr, err := caddy.ParseNetworkAddress(adminListen)
+	if err != nil {
+		return nil, "", fmt.Errorf("invalid admin listen address %s: %w", adminListen, err)
+	}
+	if adminAddr.PortRangeSize() > 1 {
+		return nil, "", fmt.Errorf("admin listen address %s must resolve to a single endpoint", adminListen)
+	}
+
+	if adminAddr.IsUnixNetwork() {
+		socketPath, _, _ := strings.Cut(adminAddr.Host, "|")
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, adminAddr.Network, socketPath)
+		}
+		return &http.Client{Transport: transport}, "http://127.0.0.1/load", nil
+	}
+
+	return http.DefaultClient, "http://" + server + ":2019/load", nil
 }
 
 // prepareServerConfig builds the config to push to server from the loader's last
